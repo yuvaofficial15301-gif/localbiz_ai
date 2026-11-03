@@ -1,3 +1,4 @@
+
 name: Build Android APK
 
 on:
@@ -6,7 +7,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # needed only to attach the APK to a GitHub Release
+  contents: write
 
 defaults:
   run:
@@ -16,16 +17,20 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+
     steps:
+      # 1. Checkout project
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. Setup Java
       - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. Setup Flutter
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -33,52 +38,142 @@ jobs:
           channel: stable
           cache: true
 
+      # 4. Check Flutter
       - name: Flutter version
         run: flutter --version
 
-      - name: Generate Android scaffold (kept out of git on purpose)
+      # 5. Generate Android project
+      - name: Generate Android scaffold
         run: |
           if [ ! -d android ]; then
             tmp="$(mktemp -d)"
-            (cd "$tmp" && flutter create --platforms=android --org com.localbiz --project-name localbiz_ai app)
+            (
+              cd "$tmp"
+              flutter create \
+                --platforms=android \
+                --org com.localbiz \
+                --project-name localbiz_ai app
+            )
             cp -r "$tmp/app/android" ./android
           fi
 
-      - name: Patch Android project (permissions, signing, biometrics)
+      # 6. Patch Android project
+      - name: Patch Android project
         run: python3 tool/patch_android.py
 
-      - name: Install SQLite for unit tests
-        run: sudo apt-get update && sudo apt-get install -y libsqlite3-dev
+      # 7. Install SQLite
+      - name: Install SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsqlite3-dev
 
+      # 8. Get Flutter dependencies
       - name: Get packages
         run: flutter pub get
 
+      # 9. Fix speech_to_text Gradle compatibility
+      - name: Fix speech_to_text Android Gradle configuration
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          cache = Path.home() / ".pub-cache/hosted/pub.dev"
+
+          plugins = list(
+              cache.glob("speech_to_text-*/android/build.gradle")
+          )
+
+          if not plugins:
+              raise SystemExit(
+                  "ERROR: speech_to_text Android Gradle file not found"
+              )
+
+          for plugin in plugins:
+              content = plugin.read_text()
+
+              replacements = {
+                  "flutter.compileSdkVersion": "35",
+                  "flutter.minSdkVersion": "21",
+                  "flutter.targetSdkVersion": "35",
+              }
+
+              changed = False
+
+              for old, new in replacements.items():
+                  if old in content:
+                      content = content.replace(old, new)
+                      changed = True
+
+              if changed:
+                  plugin.write_text(content)
+                  print("Patched speech plugin:", plugin)
+              else:
+                  print("No Flutter SDK references found:", plugin)
+
+          # Fix application compile SDK if it uses Flutter references
+          app_gradle = Path("android/app/build.gradle")
+
+          if not app_gradle.exists():
+              raise SystemExit("ERROR: app/build.gradle not found")
+
+          app = app_gradle.read_text()
+
+          app, count = re.subn(
+              r"(?m)^(\s*compileSdk(?:Version)?\s*=?\s*)flutter\.compileSdkVersion\b",
+              r"\g<1>35",
+              app,
+          )
+
+          if count:
+              app_gradle.write_text(app)
+              print("Application compile SDK set to 35")
+          else:
+              print("Application compile SDK already configured")
+
+          print("Gradle compatibility patch completed")
+          PY
+
+      # 10. Analyze Flutter project
       - name: Analyze
         continue-on-error: true
-        run: flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee analyze.log
+        run: |
+          flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee analyze.log
 
+      # 11. Run tests
       - name: Run tests
         continue-on-error: true
-        run: flutter test --reporter expanded 2>&1 | tee test.log
+        run: |
+          flutter test --reporter expanded 2>&1 | tee test.log
 
+      # 12. Build APK
       - name: Build release APK
-        run: flutter build apk --release 2>&1 | tee build.log
+        run: |
+          flutter build apk --release 2>&1 | tee build.log
 
+      # 13. Verify APK
       - name: Verify APK
         run: |
           APK=build/app/outputs/flutter-apk/app-release.apk
+
           test -s "$APK"
-          ls -l "$APK"
+
+          ls -lh "$APK"
+
           sha256sum "$APK"
+
           cp "$APK" LocalBizAI-release.apk
 
+      # 14. Upload APK artifact
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
-          name: LocalBizAI-apk
+          name: LocalBizAI-release
           path: LocalBizAI-release.apk
           if-no-files-found: error
+          retention-days: 30
 
+      # 15. Upload build logs
       - name: Upload logs
         if: always()
         uses: actions/upload-artifact@v4
@@ -90,8 +185,9 @@ jobs:
             build.log
           if-no-files-found: ignore
 
-      - name: Publish GitHub Release (optional, easiest download on a phone)
-        if: github.event_name == 'push'
+      # 16. Publish GitHub Release
+      - name: Publish GitHub Release
+        if: success() && github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: build-${{ github.run_number }}
