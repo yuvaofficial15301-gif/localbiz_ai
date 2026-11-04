@@ -1,5 +1,5 @@
 
-name: Build Android APK
+name: Build LocalBiz AI APK
 
 on:
   workflow_dispatch:
@@ -16,18 +16,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Download project source
+      # 1. Checkout project
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      # 2. Install Java
+      # 2. Java setup
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Install Flutter
+      # 3. Flutter setup
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -35,13 +35,13 @@ jobs:
           channel: stable
           cache: true
 
-      # 4. Check Flutter installation
+      # 4. Check Flutter
       - name: Check Flutter
         run: |
           flutter --version
           flutter doctor -v
 
-      # 5. Generate Android folder if missing
+      # 5. Generate Android project if missing
       - name: Generate Android project
         run: |
           if [ ! -d android ]; then
@@ -56,52 +56,184 @@ jobs:
             cp -R app/android "$GITHUB_WORKSPACE/android"
           fi
 
-      # 6. Apply your Android configuration
+      # 6. Apply existing Android patches
       - name: Patch Android configuration
         run: |
           python3 tool/patch_android.py
 
-      # 7. Install SQLite
+      # 7. Install Android SDK 36
+      - name: Install Android SDK 36
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-36" "build-tools;36.0.0"
+
+      # 8. Install SQLite
       - name: Install SQLite
         run: |
           sudo apt-get update
           sudo apt-get install -y sqlite3 libsqlite3-dev
 
-      # 8. Download Flutter dependencies
+      # 9. Get Flutter dependencies
       - name: Get Flutter dependencies
         run: flutter pub get
 
-      # 9. Inspect the actual speech_to_text plugin
-      - name: Inspect speech_to_text Gradle configuration
+      # 10. Fix speech_to_text Gradle configuration
+      - name: Fix speech_to_text Gradle configuration
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import re
+
+          cache = os.path.expanduser(
+              "~/.pub-cache/hosted/pub.dev"
+          )
+
+          matches = glob.glob(
+              os.path.join(
+                  cache,
+                  "speech_to_text-*",
+                  "android",
+                  "build.gradle"
+              )
+          )
+
+          if not matches:
+              raise SystemExit(
+                  "speech_to_text plugin Gradle file not found"
+              )
+
+          for path in matches:
+              print("Patching:", path)
+
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+
+              original = content
+
+              content = re.sub(
+                  r"compileSdk\s*=\s*flutter\.compileSdkVersion",
+                  "compileSdk = 36",
+                  content
+              )
+
+              content = re.sub(
+                  r"compileSdkVersion\s+flutter\.compileSdkVersion",
+                  "compileSdkVersion 36",
+                  content
+              )
+
+              # This library does not need the Flutter NDK
+              # extension reference.
+              content = re.sub(
+                  r"^\s*ndkVersion\s*=\s*flutter\.ndkVersion\s*\n",
+                  "",
+                  content,
+                  flags=re.MULTILINE
+              )
+
+              if content == original:
+                  if "flutter.compileSdkVersion" in content:
+                      raise SystemExit(
+                          "Could not patch compileSdk reference"
+                      )
+
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+
+              print("Updated plugin Gradle file.")
+
+              if "flutter.compileSdkVersion" in content:
+                  raise SystemExit(
+                      "Flutter compileSdk reference remains"
+                  )
+
+              if "flutter.ndkVersion" in content:
+                  raise SystemExit(
+                      "Flutter ndkVersion reference remains"
+                  )
+
+              print("Plugin Gradle configuration verified.")
+
+          PY
+
+      # 11. Set application compile SDK to 36
+      - name: Configure application SDK
+        run: |
+          python3 - <<'PY'
+          import re
+
+          path = "android/app/build.gradle"
+
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          updated = re.sub(
+              r"compileSdk\s*=\s*flutter\.compileSdkVersion",
+              "compileSdk = 36",
+              content
+          )
+
+          updated = re.sub(
+              r"compileSdkVersion\s+flutter\.compileSdkVersion",
+              "compileSdkVersion 36",
+              updated
+          )
+
+          if updated == content and "compileSdk = 36" not in content:
+              raise SystemExit(
+                  "Could not locate application compileSdk setting"
+              )
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(updated)
+
+          print("Application compile SDK configured.")
+          PY
+
+      # 12. Verify plugin configuration
+      - name: Verify speech_to_text configuration
         run: |
           FILE=$(find "$HOME/.pub-cache/hosted/pub.dev" \
-            -path "*/speech_to_text-7.4.0/android/build.gradle" \
-            ! -path "*/example/*" \
+            -path "*/speech_to_text-*/android/build.gradle" \
             | head -n 1)
 
-          echo "PLUGIN FILE: $FILE"
+          echo "Plugin Gradle file: $FILE"
+          cat "$FILE"
 
-          if [ ! -f "$FILE" ]; then
-            echo "ERROR: Plugin Gradle file not found"
+          if grep -q "flutter.compileSdkVersion\|flutter.ndkVersion" "$FILE"; then
+            echo "ERROR: Flutter references still exist."
             exit 1
           fi
 
-          echo "========== PLUGIN GRADLE FILE =========="
-          nl -ba "$FILE" | head -80
+          echo "speech_to_text Gradle configuration is patched."
 
-          echo "========== FLUTTER SDK REFERENCES =========="
-          grep -nE "flutter|compileSdk|minSdk|targetSdk" "$FILE" || true
-
-      # 10. Check Android app configuration
-      - name: Inspect Android app configuration
-        run: |
-          echo "========== APP GRADLE =========="
-          cat android/app/build.gradle
-
-          echo "========== ANDROID MANIFEST =========="
-          cat android/app/src/main/AndroidManifest.xml
-
-      # 11. Analyze Flutter project
+      # 13. Analyze Flutter project
       - name: Analyze Flutter project
         run: flutter analyze
         continue-on-error: true
+
+      # 14. Build release APK
+      - name: Build release APK
+        run: flutter build apk --release
+
+      # 15. Verify APK
+      - name: Verify APK
+        run: |
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "APK file not found!"
+            exit 1
+          fi
+
+          ls -lh "$APK"
+
+      # 16. Upload APK
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: localbiz-ai-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
