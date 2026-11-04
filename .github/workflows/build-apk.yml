@@ -16,18 +16,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout project
+      # 1. Checkout
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      # 2. Install Java
+      # 2. Java
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Install Flutter
+      # 3. Flutter
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -56,16 +56,14 @@ jobs:
             cp -R app/android "$GITHUB_WORKSPACE/android"
           fi
 
-      # 6. Apply existing Android configuration
+      # 6. Apply project Android configuration
       - name: Patch Android configuration
         run: |
           python3 tool/patch_android.py
 
-      # 7. Install Android SDK 36
-      - name: Install Android SDK 36
+      # 7. Install Android SDK and NDK
+      - name: Install Android SDK and NDK
         run: |
-          echo "ANDROID_HOME=$ANDROID_HOME"
-
           SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
 
           if [ ! -f "$SDKMANAGER" ]; then
@@ -75,17 +73,15 @@ jobs:
 
           if [ ! -f "$SDKMANAGER" ]; then
             echo "ERROR: sdkmanager not found"
-            find "${ANDROID_HOME}" -name sdkmanager -type f || true
             exit 1
           fi
-
-          echo "Using sdkmanager: $SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses >/dev/null
 
           "$SDKMANAGER" \
             "platforms;android-36" \
-            "build-tools;36.0.0"
+            "build-tools;36.0.0" \
+            "ndk;26.1.10909125"
 
       # 8. Install SQLite
       - name: Install SQLite
@@ -93,13 +89,13 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sqlite3 libsqlite3-dev
 
-      # 9. Download Flutter dependencies
+      # 9. Get Flutter dependencies
       - name: Get Flutter dependencies
         run: |
           flutter pub get
 
-      # 10. Fix speech_to_text Gradle configuration
-      - name: Fix speech_to_text Gradle configuration
+      # 10. Patch Android plugin Gradle files
+      - name: Fix Android plugin Gradle configurations
         run: |
           python3 - <<'PY'
           import glob
@@ -110,63 +106,65 @@ jobs:
               "~/.pub-cache/hosted/pub.dev"
           )
 
-          matches = glob.glob(
-              os.path.join(
-                  cache,
-                  "speech_to_text-*",
-                  "android",
-                  "build.gradle"
-              )
-          )
+          patterns = [
+              os.path.join(cache, "*", "android", "build.gradle"),
+              os.path.join(cache, "*", "android", "build.gradle.kts"),
+          ]
 
-          if not matches:
-              raise SystemExit(
-                  "speech_to_text Gradle file not found"
-              )
+          files = []
+          for pattern in patterns:
+              files.extend(glob.glob(pattern))
 
-          for path in matches:
-              print("Patching:", path)
+          patched_count = 0
 
+          for path in files:
               with open(path, "r", encoding="utf-8") as f:
                   content = f.read()
 
-              content = re.sub(
-                  r"compileSdk\s*=\s*flutter\.compileSdkVersion",
-                  "compileSdk = 36",
-                  content
-              )
+              original = content
 
-              content = re.sub(
-                  r"compileSdkVersion\s+flutter\.compileSdkVersion",
-                  "compileSdkVersion 36",
-                  content
-              )
+              replacements = {
+                  "flutter.compileSdkVersion": "36",
+                  "flutter.minSdkVersion": "21",
+                  "flutter.targetSdkVersion": "36",
+                  "flutter.ndkVersion": '"26.1.10909125"',
+              }
 
-              content = re.sub(
-                  r"^\s*ndkVersion\s*=\s*flutter\.ndkVersion\s*\n",
-                  "",
-                  content,
-                  flags=re.MULTILINE
-              )
+              for old, new in replacements.items():
+                  content = content.replace(old, new)
 
-              if "flutter.compileSdkVersion" in content:
-                  raise SystemExit(
-                      "Could not patch compileSdk reference"
-                  )
+              if content != original:
+                  with open(path, "w", encoding="utf-8") as f:
+                      f.write(content)
 
-              if "flutter.ndkVersion" in content:
-                  raise SystemExit(
-                      "Could not patch ndkVersion reference"
-                  )
+                  patched_count += 1
+                  print("Patched:", path)
 
-              with open(path, "w", encoding="utf-8") as f:
-                  f.write(content)
+          print(
+              "Total Android plugin Gradle files patched:",
+              patched_count
+          )
 
-              print("speech_to_text Gradle file patched.")
+          # Confirm no Flutter SDK references remain
+          remaining = []
 
+          for path in files:
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+
+              if re.search(r"flutter\.(compileSdkVersion|minSdkVersion|targetSdkVersion|ndkVersion)", content):
+                  remaining.append(path)
+
+          if remaining:
+              print("Unpatched Flutter SDK references:")
+              for path in remaining:
+                  print(path)
+              raise SystemExit(1)
+
+          print("Android plugin SDK references verified.")
           PY
 
-      # 11. Configure app compile SDK
+      # 11. Configure application SDK
       - name: Configure application SDK
         run: |
           python3 - <<'PY'
@@ -177,51 +175,58 @@ jobs:
           with open(path, "r", encoding="utf-8") as f:
               content = f.read()
 
-          updated = re.sub(
-              r"compileSdk\s*=\s*flutter\.compileSdkVersion",
-              "compileSdk = 36",
+          content, count = re.subn(
+              r"flutter\.compileSdkVersion",
+              "36",
               content
           )
 
-          updated = re.sub(
-              r"compileSdkVersion\s+flutter\.compileSdkVersion",
-              "compileSdkVersion 36",
-              updated
-          )
-
-          if updated == content and "compileSdk = 36" not in content:
+          if count == 0 and not re.search(
+              r"compileSdk\s*(?:=)?\s*36",
+              content
+          ):
               raise SystemExit(
-                  "Could not configure application compileSdk"
+                  "Could not locate application compile SDK setting"
               )
 
           with open(path, "w", encoding="utf-8") as f:
-              f.write(updated)
+              f.write(content)
 
           print("Application compile SDK set to 36.")
           PY
 
-      # 12. Verify speech plugin
-      - name: Verify speech_to_text configuration
+      # 12. Verify important plugins
+      - name: Verify plugin Gradle files
         run: |
-          FILE=$(find "$HOME/.pub-cache/hosted/pub.dev" \
-            -path "*/speech_to_text-*/android/build.gradle" \
-            | head -n 1)
+          for PLUGIN in speech_to_text sqlite3_flutter_libs; do
+            echo "Checking $PLUGIN"
 
-          echo "Plugin: $FILE"
-          cat "$FILE"
+            FILE=$(find "$HOME/.pub-cache/hosted/pub.dev" \
+              -path "*/$PLUGIN-*/android/build.gradle" \
+              | head -n 1)
 
-          if grep -qE \
-            'flutter\.compileSdkVersion|flutter\.ndkVersion' "$FILE"; then
-            echo "ERROR: Flutter Gradle references remain."
-            exit 1
-          fi
+            if [ -z "$FILE" ]; then
+              echo "$PLUGIN Gradle file not found"
+              exit 1
+            fi
 
-          echo "Plugin configuration verified."
+            echo "File: $FILE"
+            grep -nE "compileSdk|minSdk|targetSdk|ndkVersion|flutter\." \
+              "$FILE" || true
 
-      # 13. Analyze Flutter project
+            if grep -qE \
+              "flutter\.(compileSdkVersion|minSdkVersion|targetSdkVersion|ndkVersion)" \
+              "$FILE"; then
+              echo "Unpatched SDK reference in $PLUGIN"
+              exit 1
+            fi
+          done
+
+          echo "Plugin verification complete."
+
+      # 13. Flutter analysis
       - name: Analyze Flutter project
-        run: |
-          flutter analyze
+        run: flutter analyze
         continue-on-error: true
 
       # 14. Build APK
