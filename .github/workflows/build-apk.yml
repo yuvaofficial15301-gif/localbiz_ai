@@ -7,20 +7,27 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
 jobs:
   build:
+    name: Build LocalBiz AI APK
     runs-on: ubuntu-latest
 
     steps:
+      # 1. Download project source
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2. Install Java
       - name: Set up Java
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. Install Flutter
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -28,53 +35,73 @@ jobs:
           channel: stable
           cache: true
 
+      # 4. Check Flutter installation
       - name: Check Flutter
         run: |
           flutter --version
           flutter doctor -v
 
+      # 5. Generate Android folder if missing
       - name: Generate Android project
         run: |
           if [ ! -d android ]; then
             mkdir -p /tmp/android_scaffold
             cd /tmp/android_scaffold
+
             flutter create \
               --platforms=android \
               --org com.localbiz \
               --project-name localbiz_ai app
+
             cp -R app/android "$GITHUB_WORKSPACE/android"
           fi
 
+      # 6. Apply your Android configuration
       - name: Patch Android configuration
         run: |
           python3 tool/patch_android.py
 
+      # 7. Install SQLite
       - name: Install SQLite
         run: |
           sudo apt-get update
           sudo apt-get install -y sqlite3 libsqlite3-dev
 
+      # 8. Download Flutter dependencies
       - name: Get Flutter dependencies
         run: flutter pub get
 
-      - name: Debug speech_to_text Gradle file
+      # 9. Inspect the actual speech_to_text plugin
+      - name: Inspect speech_to_text Gradle configuration
         run: |
           FILE=$(find "$HOME/.pub-cache/hosted/pub.dev" \
-            -path "*/speech_to_text-*/android/build.gradle" \
+            -path "*/speech_to_text-7.4.0/android/build.gradle" \
+            ! -path "*/example/*" \
             | head -n 1)
 
           echo "PLUGIN FILE: $FILE"
-          echo "--------------------------------"
-          if [ -f "$FILE" ]; then
-            nl -ba "$FILE" | head -60
-            echo "--------------------------------"
-            grep -nE "flutter|compileSdk|minSdk|targetSdk" "$FILE" || true
-          else
-            echo "speech_to_text Gradle file not found"
+
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: Plugin Gradle file not found"
             exit 1
           fi
 
-      - name: Show Android SDK configuration
+          echo "========== PLUGIN GRADLE FILE =========="
+          nl -ba "$FILE" | head -80
+
+          echo "========== FLUTTER SDK REFERENCES =========="
+          grep -nE "flutter|compileSdk|minSdk|targetSdk" "$FILE" || true
+
+      # 10. Check Android app configuration
+      - name: Inspect Android app configuration
         run: |
-          echo "Android app Gradle configuration:"
+          echo "========== APP GRADLE =========="
           cat android/app/build.gradle
+
+          echo "========== ANDROID MANIFEST =========="
+          cat android/app/src/main/AndroidManifest.xml
+
+      # 11. Analyze Flutter project
+      - name: Analyze Flutter project
+        run: flutter analyze
+        continue-on-error: true
