@@ -1,6 +1,71 @@
 
+name: Build LocalBiz AI APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build LocalBiz AI APK
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1. Checkout project
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      # 2. Install Java
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # 3. Install Flutter
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      # 4. Check Flutter
+      - name: Check Flutter
+        run: |
+          flutter --version
+          flutter doctor -v
+
+      # 5. Generate Android project if missing
+      - name: Generate Android project
+        run: |
+          if [ ! -d android ]; then
+            mkdir -p /tmp/android_scaffold
+            cd /tmp/android_scaffold
+
+            flutter create \
+              --platforms=android \
+              --org com.localbiz \
+              --project-name localbiz_ai app
+
+            cp -R app/android "$GITHUB_WORKSPACE/android"
+          fi
+
+      # 6. Apply existing Android configuration
+      - name: Patch Android configuration
+        run: |
+          python3 tool/patch_android.py
+
+      # 7. Install Android SDK 36
       - name: Install Android SDK 36
         run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+
           SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
 
           if [ ! -f "$SDKMANAGER" ]; then
@@ -9,15 +74,179 @@
           fi
 
           if [ ! -f "$SDKMANAGER" ]; then
-            echo "sdkmanager not found in Android SDK."
+            echo "ERROR: sdkmanager not found"
             find "${ANDROID_HOME}" -name sdkmanager -type f || true
             exit 1
           fi
 
-          echo "Using: $SDKMANAGER"
+          echo "Using sdkmanager: $SDKMANAGER"
 
           yes | "$SDKMANAGER" --licenses >/dev/null
 
           "$SDKMANAGER" \
             "platforms;android-36" \
             "build-tools;36.0.0"
+
+      # 8. Install SQLite
+      - name: Install SQLite
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 libsqlite3-dev
+
+      # 9. Download Flutter dependencies
+      - name: Get Flutter dependencies
+        run: |
+          flutter pub get
+
+      # 10. Fix speech_to_text Gradle configuration
+      - name: Fix speech_to_text Gradle configuration
+        run: |
+          python3 - <<'PY'
+          import glob
+          import os
+          import re
+
+          cache = os.path.expanduser(
+              "~/.pub-cache/hosted/pub.dev"
+          )
+
+          matches = glob.glob(
+              os.path.join(
+                  cache,
+                  "speech_to_text-*",
+                  "android",
+                  "build.gradle"
+              )
+          )
+
+          if not matches:
+              raise SystemExit(
+                  "speech_to_text Gradle file not found"
+              )
+
+          for path in matches:
+              print("Patching:", path)
+
+              with open(path, "r", encoding="utf-8") as f:
+                  content = f.read()
+
+              content = re.sub(
+                  r"compileSdk\s*=\s*flutter\.compileSdkVersion",
+                  "compileSdk = 36",
+                  content
+              )
+
+              content = re.sub(
+                  r"compileSdkVersion\s+flutter\.compileSdkVersion",
+                  "compileSdkVersion 36",
+                  content
+              )
+
+              content = re.sub(
+                  r"^\s*ndkVersion\s*=\s*flutter\.ndkVersion\s*\n",
+                  "",
+                  content,
+                  flags=re.MULTILINE
+              )
+
+              if "flutter.compileSdkVersion" in content:
+                  raise SystemExit(
+                      "Could not patch compileSdk reference"
+                  )
+
+              if "flutter.ndkVersion" in content:
+                  raise SystemExit(
+                      "Could not patch ndkVersion reference"
+                  )
+
+              with open(path, "w", encoding="utf-8") as f:
+                  f.write(content)
+
+              print("speech_to_text Gradle file patched.")
+
+          PY
+
+      # 11. Configure app compile SDK
+      - name: Configure application SDK
+        run: |
+          python3 - <<'PY'
+          import re
+
+          path = "android/app/build.gradle"
+
+          with open(path, "r", encoding="utf-8") as f:
+              content = f.read()
+
+          updated = re.sub(
+              r"compileSdk\s*=\s*flutter\.compileSdkVersion",
+              "compileSdk = 36",
+              content
+          )
+
+          updated = re.sub(
+              r"compileSdkVersion\s+flutter\.compileSdkVersion",
+              "compileSdkVersion 36",
+              updated
+          )
+
+          if updated == content and "compileSdk = 36" not in content:
+              raise SystemExit(
+                  "Could not configure application compileSdk"
+              )
+
+          with open(path, "w", encoding="utf-8") as f:
+              f.write(updated)
+
+          print("Application compile SDK set to 36.")
+          PY
+
+      # 12. Verify speech plugin
+      - name: Verify speech_to_text configuration
+        run: |
+          FILE=$(find "$HOME/.pub-cache/hosted/pub.dev" \
+            -path "*/speech_to_text-*/android/build.gradle" \
+            | head -n 1)
+
+          echo "Plugin: $FILE"
+          cat "$FILE"
+
+          if grep -qE \
+            'flutter\.compileSdkVersion|flutter\.ndkVersion' "$FILE"; then
+            echo "ERROR: Flutter Gradle references remain."
+            exit 1
+          fi
+
+          echo "Plugin configuration verified."
+
+      # 13. Analyze Flutter project
+      - name: Analyze Flutter project
+        run: |
+          flutter analyze
+        continue-on-error: true
+
+      # 14. Build APK
+      - name: Build release APK
+        run: |
+          flutter build apk --release
+
+      # 15. Verify APK
+      - name: Verify APK
+        run: |
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+
+          if [ ! -f "$APK" ]; then
+            echo "APK was not generated!"
+            exit 1
+          fi
+
+          echo "APK generated successfully:"
+          ls -lh "$APK"
+
+      # 16. Upload APK
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: localbiz-ai-release-apk
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
+          retention-days: 30
