@@ -16,18 +16,18 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout
+      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      # 2. Java
+      # 2. Set up Java
       - name: Set up Java
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      # 3. Flutter
+      # 3. Set up Flutter
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
@@ -56,23 +56,20 @@ jobs:
             cp -R app/android "$GITHUB_WORKSPACE/android"
           fi
 
-      # 6. Apply project Android configuration
+      # 6. Patch Android configuration
       - name: Patch Android configuration
         run: |
           python3 tool/patch_android.py
 
       # 7. Install Android SDK and NDK
       - name: Install Android SDK and NDK
+        shell: bash
         run: |
-          SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
+            -name sdkmanager -type f | head -n 1)
 
-          if [ ! -f "$SDKMANAGER" ]; then
-            SDKMANAGER=$(find "${ANDROID_HOME}/cmdline-tools" \
-              -name sdkmanager -type f | head -n 1)
-          fi
-
-          if [ ! -f "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager not found"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "ERROR: Android SDK manager not found"
             exit 1
           fi
 
@@ -94,8 +91,9 @@ jobs:
         run: |
           flutter pub get
 
-      # 10. Patch Android plugin Gradle files
+      # 10. Fix Android plugin Gradle configurations
       - name: Fix Android plugin Gradle configurations
+        shell: bash
         run: |
           python3 - <<'PY'
           import glob
@@ -117,18 +115,18 @@ jobs:
 
           patched_count = 0
 
+          replacements = {
+              "flutter.compileSdkVersion": "36",
+              "flutter.minSdkVersion": "21",
+              "flutter.targetSdkVersion": "36",
+              "flutter.ndkVersion": '"26.1.10909125"',
+          }
+
           for path in files:
               with open(path, "r", encoding="utf-8") as f:
                   content = f.read()
 
               original = content
-
-              replacements = {
-                  "flutter.compileSdkVersion": "36",
-                  "flutter.minSdkVersion": "21",
-                  "flutter.targetSdkVersion": "36",
-                  "flutter.ndkVersion": '"26.1.10909125"',
-              }
 
               for old, new in replacements.items():
                   content = content.replace(old, new)
@@ -140,32 +138,33 @@ jobs:
                   patched_count += 1
                   print("Patched:", path)
 
-          print(
-              "Total Android plugin Gradle files patched:",
-              patched_count
-          )
+          print("Total plugin Gradle files patched:", patched_count)
 
-          # Confirm no Flutter SDK references remain
+          # Check remaining Flutter SDK references
           remaining = []
 
           for path in files:
               with open(path, "r", encoding="utf-8") as f:
                   content = f.read()
 
-              if re.search(r"flutter\.(compileSdkVersion|minSdkVersion|targetSdkVersion|ndkVersion)", content):
+              if re.search(
+                  r"flutter\.(compileSdkVersion|minSdkVersion|targetSdkVersion|ndkVersion)",
+                  content
+              ):
                   remaining.append(path)
 
           if remaining:
-              print("Unpatched Flutter SDK references:")
+              print("Unpatched references:")
               for path in remaining:
                   print(path)
               raise SystemExit(1)
 
-          print("Android plugin SDK references verified.")
+          print("Plugin SDK references verified.")
           PY
 
       # 11. Configure application SDK
       - name: Configure application SDK
+        shell: bash
         run: |
           python3 - <<'PY'
           import re
@@ -175,67 +174,91 @@ jobs:
           with open(path, "r", encoding="utf-8") as f:
               content = f.read()
 
-          content, count = re.subn(
+          content = re.sub(
               r"flutter\.compileSdkVersion",
               "36",
               content
           )
 
-          if count == 0 and not re.search(
+          if not re.search(
               r"compileSdk\s*(?:=)?\s*36",
               content
           ):
               raise SystemExit(
-                  "Could not locate application compile SDK setting"
+                  "Could not set application compile SDK to 36"
               )
 
           with open(path, "w", encoding="utf-8") as f:
               f.write(content)
 
-          print("Application compile SDK set to 36.")
+          print("Application compile SDK configured: 36")
           PY
 
-      # 12. Verify important plugins
+      # 12. Verify actual plugin Gradle files
       - name: Verify plugin Gradle files
+        shell: bash
         run: |
-          for PLUGIN in speech_to_text sqlite3_flutter_libs; do
-            echo "Checking $PLUGIN"
+          CACHE="$HOME/.pub-cache/hosted/pub.dev"
 
-            FILE=$(find "$HOME/.pub-cache/hosted/pub.dev" \
-              -path "*/$PLUGIN-*/android/build.gradle" \
+          for PLUGIN in speech_to_text sqlite3_flutter_libs; do
+            echo ""
+            echo "======================================"
+            echo "Checking plugin: $PLUGIN"
+            echo "======================================"
+
+            PLUGIN_DIR=$(find "$CACHE" \
+              -maxdepth 1 \
+              -type d \
+              -name "${PLUGIN}-*" \
               | head -n 1)
 
-            if [ -z "$FILE" ]; then
-              echo "$PLUGIN Gradle file not found"
+            if [ -z "$PLUGIN_DIR" ]; then
+              echo "Plugin directory not found: $PLUGIN"
+              find "$CACHE" -maxdepth 1 -type d \
+                | grep -E "speech_to_text|sqlite3" || true
               exit 1
             fi
 
-            echo "File: $FILE"
-            grep -nE "compileSdk|minSdk|targetSdk|ndkVersion|flutter\." \
-              "$FILE" || true
+            echo "Plugin directory: $PLUGIN_DIR"
+
+            GRADLE_FILE=$(find "$PLUGIN_DIR/android" \
+              -type f \
+              \( -name "build.gradle" -o -name "build.gradle.kts" \) \
+              ! -path "*/example/*" \
+              2>/dev/null | head -n 1)
+
+            if [ -z "$GRADLE_FILE" ]; then
+              echo "Android Gradle file not found for $PLUGIN"
+              find "$PLUGIN_DIR/android" -type f 2>/dev/null || true
+              exit 1
+            fi
+
+            echo "Gradle file: $GRADLE_FILE"
+            cat "$GRADLE_FILE"
 
             if grep -qE \
-              "flutter\.(compileSdkVersion|minSdkVersion|targetSdkVersion|ndkVersion)" \
-              "$FILE"; then
-              echo "Unpatched SDK reference in $PLUGIN"
+              'flutter\.(compileSdkVersion|minSdkVersion|targetSdkVersion|ndkVersion)' \
+              "$GRADLE_FILE"; then
+              echo "Unpatched Flutter SDK reference found!"
               exit 1
             fi
+
+            echo "$PLUGIN verification passed."
           done
 
-          echo "Plugin verification complete."
-
-      # 13. Flutter analysis
+      # 13. Analyze Flutter project
       - name: Analyze Flutter project
         run: flutter analyze
         continue-on-error: true
 
-      # 14. Build APK
+      # 14. Build release APK
       - name: Build release APK
         run: |
           flutter build apk --release
 
       # 15. Verify APK
       - name: Verify APK
+        shell: bash
         run: |
           APK="build/app/outputs/flutter-apk/app-release.apk"
 
@@ -247,7 +270,7 @@ jobs:
           echo "APK generated successfully:"
           ls -lh "$APK"
 
-      # 16. Upload APK
+      # 16. Upload APK artifact
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
