@@ -43,6 +43,7 @@ jobs:
 
       # 5. Generate Android project if missing
       - name: Generate Android project
+        shell: bash
         run: |
           if [ ! -d android ]; then
             mkdir -p /tmp/android_scaffold
@@ -65,20 +66,47 @@ jobs:
       - name: Install Android SDK and NDK
         shell: bash
         run: |
-          SDKMANAGER=$(find "$ANDROID_HOME/cmdline-tools" \
-            -name sdkmanager -type f | head -n 1)
+          set -e
+
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}"
+
+          echo "Android SDK: $SDK_ROOT"
+
+          SDKMANAGER=$(find "$SDK_ROOT/cmdline-tools" \
+            -type f -name sdkmanager 2>/dev/null \
+            | sort -V | tail -n 1)
 
           if [ -z "$SDKMANAGER" ]; then
-            echo "ERROR: Android SDK manager not found"
+            echo "ERROR: sdkmanager was not found."
+            find "$SDK_ROOT" -name sdkmanager -type f || true
             exit 1
           fi
 
-          yes | "$SDKMANAGER" --licenses >/dev/null
+          echo "Found SDK manager: $SDKMANAGER"
 
-          "$SDKMANAGER" \
+          chmod +x "$SDKMANAGER"
+
+          echo "Accepting Android SDK licenses..."
+
+          # Preserve sdkmanager's exit code, not yes's SIGPIPE.
+          set +o pipefail
+          yes | "$SDKMANAGER" --licenses
+          LICENSE_STATUS=${PIPESTATUS[1]}
+          set -o pipefail
+
+          if [ "$LICENSE_STATUS" -ne 0 ]; then
+            echo "Android SDK license acceptance failed."
+            exit 1
+          fi
+
+          echo "Installing Android SDK 36 and NDK..."
+
+          "$SDKMANAGER" --install \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;26.1.10909125"
+
+          echo "Android SDK installation completed."
 
       # 8. Install SQLite
       - name: Install SQLite
@@ -104,16 +132,15 @@ jobs:
               "~/.pub-cache/hosted/pub.dev"
           )
 
-          patterns = [
-              os.path.join(cache, "*", "android", "build.gradle"),
-              os.path.join(cache, "*", "android", "build.gradle.kts"),
-          ]
-
           files = []
-          for pattern in patterns:
-              files.extend(glob.glob(pattern))
 
-          patched_count = 0
+          for pattern in (
+              "*/android/build.gradle",
+              "*/android/build.gradle.kts",
+          ):
+              files.extend(
+                  glob.glob(os.path.join(cache, pattern))
+              )
 
           replacements = {
               "flutter.compileSdkVersion": "36",
@@ -121,6 +148,8 @@ jobs:
               "flutter.targetSdkVersion": "36",
               "flutter.ndkVersion": '"26.1.10909125"',
           }
+
+          patched = 0
 
           for path in files:
               with open(path, "r", encoding="utf-8") as f:
@@ -135,12 +164,12 @@ jobs:
                   with open(path, "w", encoding="utf-8") as f:
                       f.write(content)
 
-                  patched_count += 1
+                  patched += 1
                   print("Patched:", path)
 
-          print("Total plugin Gradle files patched:", patched_count)
+          print("Plugin Gradle files checked:", len(files))
+          print("Plugin Gradle files patched:", patched)
 
-          # Check remaining Flutter SDK references
           remaining = []
 
           for path in files:
@@ -154,7 +183,7 @@ jobs:
                   remaining.append(path)
 
           if remaining:
-              print("Unpatched references:")
+              print("Unpatched Flutter SDK references:")
               for path in remaining:
                   print(path)
               raise SystemExit(1)
@@ -174,24 +203,25 @@ jobs:
           with open(path, "r", encoding="utf-8") as f:
               content = f.read()
 
-          content = re.sub(
-              r"flutter\.compileSdkVersion",
-              "36",
+          pattern = (
+              r"(?m)^(\s*compileSdk(?:Version)?\s*(?:=\s*)?).*$"
+          )
+
+          content, count = re.subn(
+              pattern,
+              lambda match: match.group(1) + "36",
               content
           )
 
-          if not re.search(
-              r"compileSdk\s*(?:=)?\s*36",
-              content
-          ):
+          if count == 0:
               raise SystemExit(
-                  "Could not set application compile SDK to 36"
+                  "Could not find compileSdk declaration in app/build.gradle"
               )
 
           with open(path, "w", encoding="utf-8") as f:
               f.write(content)
 
-          print("Application compile SDK configured: 36")
+          print("Application compile SDK set to 36.")
           PY
 
       # 12. Verify actual plugin Gradle files
@@ -200,26 +230,24 @@ jobs:
         run: |
           CACHE="$HOME/.pub-cache/hosted/pub.dev"
 
-          for PLUGIN in speech_to_text sqlite3_flutter_libs; do
+          for PLUGIN in speech_to_text sqlite3_sqlcipher; do
             echo ""
             echo "======================================"
-            echo "Checking plugin: $PLUGIN"
+            echo "Checking $PLUGIN"
             echo "======================================"
 
             PLUGIN_DIR=$(find "$CACHE" \
               -maxdepth 1 \
               -type d \
               -name "${PLUGIN}-*" \
-              | head -n 1)
+              | sort -V | tail -n 1)
 
             if [ -z "$PLUGIN_DIR" ]; then
-              echo "Plugin directory not found: $PLUGIN"
+              echo "Plugin not found: $PLUGIN"
               find "$CACHE" -maxdepth 1 -type d \
                 | grep -E "speech_to_text|sqlite3" || true
               exit 1
             fi
-
-            echo "Plugin directory: $PLUGIN_DIR"
 
             GRADLE_FILE=$(find "$PLUGIN_DIR/android" \
               -type f \
@@ -228,15 +256,14 @@ jobs:
               2>/dev/null | head -n 1)
 
             if [ -z "$GRADLE_FILE" ]; then
-              echo "Android Gradle file not found for $PLUGIN"
+              echo "No Android Gradle file found for $PLUGIN"
               find "$PLUGIN_DIR/android" -type f 2>/dev/null || true
               exit 1
             fi
 
             echo "Gradle file: $GRADLE_FILE"
-            cat "$GRADLE_FILE"
 
-            if grep -qE \
+            if grep -nE \
               'flutter\.(compileSdkVersion|minSdkVersion|targetSdkVersion|ndkVersion)' \
               "$GRADLE_FILE"; then
               echo "Unpatched Flutter SDK reference found!"
