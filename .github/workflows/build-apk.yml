@@ -84,15 +84,12 @@ jobs:
 
           echo "Found SDK manager: $SDKMANAGER"
 
-          chmod +x "$SDKMANAGER"
-
           echo "Accepting Android SDK licenses..."
 
-          # Preserve sdkmanager's exit code, not yes's SIGPIPE.
-          set +o pipefail
-          yes | "$SDKMANAGER" --licenses
+          set +e
+          yes | bash "$SDKMANAGER" --licenses
           LICENSE_STATUS=${PIPESTATUS[1]}
-          set -o pipefail
+          set -e
 
           if [ "$LICENSE_STATUS" -ne 0 ]; then
             echo "Android SDK license acceptance failed."
@@ -101,7 +98,7 @@ jobs:
 
           echo "Installing Android SDK 36 and NDK..."
 
-          "$SDKMANAGER" --install \
+          bash "$SDKMANAGER" --install \
             "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;26.1.10909125"
@@ -224,7 +221,7 @@ jobs:
           print("Application compile SDK set to 36.")
           PY
 
-      # 12. Verify actual plugin Gradle files
+      # 12. Verify plugin Gradle files
       - name: Verify plugin Gradle files
         shell: bash
         run: |
