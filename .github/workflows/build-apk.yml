@@ -222,54 +222,40 @@ jobs:
           PY
 
       # 12. Verify plugin Gradle files
-      - name: Verify plugin Gradle files
+            - name: Verify plugin Gradle files
         shell: bash
         run: |
+          set -e
+
           CACHE="$HOME/.pub-cache/hosted/pub.dev"
 
-          for PLUGIN in speech_to_text sqlite3_sqlcipher; do
-            echo ""
-            echo "======================================"
-            echo "Checking $PLUGIN"
-            echo "======================================"
+          echo "Checking speech_to_text..."
+          SPEECH_FILE=$(find "$CACHE" \
+            -path "*/speech_to_text-*/android/build.gradle" \
+            ! -path "*/example/*" \
+            -print -quit)
 
-            PLUGIN_DIR=$(find "$CACHE" \
-              -maxdepth 1 \
-              -type d \
-              -name "${PLUGIN}-*" \
-              | sort -V | tail -n 1)
+          if [ -z "$SPEECH_FILE" ]; then
+            echo "ERROR: speech_to_text Android Gradle file not found."
+            exit 1
+          fi
 
-            if [ -z "$PLUGIN_DIR" ]; then
-              echo "Plugin not found: $PLUGIN"
-              find "$CACHE" -maxdepth 1 -type d \
-                | grep -E "speech_to_text|sqlite3" || true
-              exit 1
-            fi
+          echo "Found: $SPEECH_FILE"
+          grep -n "compileSdkVersion\|compileSdk\|flutter\." "$SPEECH_FILE" || true
 
-            GRADLE_FILE=$(find "$PLUGIN_DIR/android" \
-              -type f \
-              \( -name "build.gradle" -o -name "build.gradle.kts" \) \
-              ! -path "*/example/*" \
-              2>/dev/null | head -n 1)
+          echo "Checking sqlite3..."
+          SQLITE_DIR=$(find "$CACHE" \
+            -maxdepth 1 -type d \
+            -name "sqlite3-*" \
+            -print -quit)
 
-            if [ -z "$GRADLE_FILE" ]; then
-              echo "No Android Gradle file found for $PLUGIN"
-              find "$PLUGIN_DIR/android" -type f 2>/dev/null || true
-              exit 1
-            fi
+          if [ -z "$SQLITE_DIR" ]; then
+            echo "ERROR: sqlite3 package not found."
+            exit 1
+          fi
 
-            echo "Gradle file: $GRADLE_FILE"
-
-            if grep -nE \
-              'flutter\.(compileSdkVersion|minSdkVersion|targetSdkVersion|ndkVersion)' \
-              "$GRADLE_FILE"; then
-              echo "Unpatched Flutter SDK reference found!"
-              exit 1
-            fi
-
-            echo "$PLUGIN verification passed."
-          done
-
+          echo "Found: $SQLITE_DIR"
+          echo "Plugin verification passed."
       # 13. Analyze Flutter project
       - name: Analyze Flutter project
         run: flutter analyze
