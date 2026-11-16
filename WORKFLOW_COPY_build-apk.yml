@@ -1,0 +1,84 @@
+name: Build LocalBiz AI APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      # Pinned on purpose: tool/patch_android.py targets the Groovy Gradle
+      # template of Flutter 3.24.x (newer Flutter generates Kotlin-DSL files).
+      - name: Set up Flutter 3.24.5
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.24.5'
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Generate Android scaffold
+        run: |
+          set -e
+          if [ ! -d android ]; then
+            tmp="$(mktemp -d)"
+            (cd "$tmp" && flutter create --platforms=android --org com.localbiz --project-name localbiz_ai app)
+            cp -r "$tmp/app/android" ./android
+          fi
+
+      - name: Patch Android project (permissions, signing, biometrics)
+        run: python3 tool/patch_android.py
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: Fix plugin Gradle files (namespace / compileSdk)
+        run: python3 tool/fix_plugins.py
+
+      - name: Analyze (informational)
+        continue-on-error: true
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings 2>&1 | tee analyze.log
+
+      - name: Build release APK
+        run: flutter build apk --release 2>&1 | tee build.log
+
+      - name: Verify APK
+        run: |
+          APK=build/app/outputs/flutter-apk/app-release.apk
+          test -s "$APK"
+          ls -lh "$APK"
+          cp "$APK" LocalBizAI-release.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LocalBizAI-apk
+          path: LocalBizAI-release.apk
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            analyze.log
+            build.log
+          if-no-files-found: ignore
